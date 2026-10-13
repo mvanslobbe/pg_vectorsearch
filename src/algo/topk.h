@@ -37,6 +37,7 @@
 #define VS_TOPK_H
 
 #include <math.h>
+#include <stdbool.h>
 #include <stdint.h>
 
 #include "core/memory.h"
@@ -71,6 +72,15 @@ typedef struct VsTopK
 	uint32_t	 cand_capacity; /* allocated capacity */
 	uint32_t	 cur_src;		/* diagnostic: rank stamped onto inserts */
 	VsMemCtx	 memctx;		/* owning context for all allocations */
+
+	/* Id -> heap position map for vs_topk_insert's dedup lookup. Built
+	 * on first use; vs_topk_insert_unique leaves it stale. */
+	uint64_t *map_ids;	 /* open-addressing keys */
+	uint32_t *map_pos;	 /* heap position per slot, UINT32_MAX if free */
+	uint32_t *ub_slot;	 /* map slot per heap position */
+	uint32_t  map_mask;	 /* map slots - 1 */
+	uint32_t  map_shift; /* 64 - log2(map slots) */
+	bool	  map_stale; /* heap changed without the map following */
 } VsTopK;
 
 /* ----------------------------------------------------------------
@@ -113,7 +123,7 @@ void vs_topk_reset(VsTopK *topk);
 void vs_topk_reset_to_k(VsTopK *topk, uint32_t k);
 
 /*
- * Same as vs_topk_insert but skips the O(k) per-insert dedup scan.
+ * Same as vs_topk_insert but skips the per-insert dedup lookup.
  * Use ONLY when the caller guarantees all ids are unique. The cluster
  * scan (where SOAR / boundary replicas can collide) must keep using
  * vs_topk_insert; centroid beam search and similar code that

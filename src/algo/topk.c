@@ -22,31 +22,144 @@
 #define VS_TOPK_INITIAL_CAP_MIN 32
 
 /* ----------------------------------------------------------------
- * Threshold heap (max-heap of Distance values)
+ * Id -> heap position map
+ *
+ * Linear probing over a power-of-two slot array sized for at most half
+ * load at k_capacity. Deletion shifts later entries back into the hole
+ * rather than leaving tombstones, so probe chains stay short however
+ * many evictions a scan makes.
  * ---------------------------------------------------------------- */
 
+#define VS_TOPK_MAP_EMPTY UINT32_MAX
+
+static inline uint32_t
+map_home(const VsTopK *topk, uint64_t id)
+{
+	return (uint32_t)((id * VS_HASH_GOLDEN_GAMMA) >> topk->map_shift);
+}
+
+/* Slot holding `id`, or VS_TOPK_MAP_EMPTY if it is not in the heap. */
+static inline uint32_t
+map_find(const VsTopK *topk, uint64_t id)
+{
+	uint32_t slot = map_home(topk, id);
+	while (topk->map_pos[slot] != VS_TOPK_MAP_EMPTY)
+	{
+		if (topk->map_ids[slot] == id)
+			return slot;
+		slot = (slot + 1) & topk->map_mask;
+	}
+	return VS_TOPK_MAP_EMPTY;
+}
+
+/* Record that heap position `pos` holds `id` (absent from the map). */
+static inline void
+map_add(VsTopK *topk, uint64_t id, uint32_t pos)
+{
+	uint32_t slot = map_home(topk, id);
+	while (topk->map_pos[slot] != VS_TOPK_MAP_EMPTY)
+		slot = (slot + 1) & topk->map_mask;
+	topk->map_ids[slot] = id;
+	topk->map_pos[slot] = pos;
+	topk->ub_slot[pos]	= slot;
+}
+
 static void
-ub_sift_up(Distance *heap, uint64_t *ids, uint32_t i)
+map_remove(VsTopK *topk, uint32_t slot)
+{
+	uint32_t mask = topk->map_mask;
+	uint32_t hole = slot;
+
+	for (uint32_t j = (hole + 1) & mask; topk->map_pos[j] != VS_TOPK_MAP_EMPTY;
+		 j			= (j + 1) & mask)
+	{
+		/* Move j into the hole unless that would put it before its
+		 * home slot, where lookups would no longer reach it. */
+		uint32_t home = map_home(topk, topk->map_ids[j]);
+		if (((j - home) & mask) >= ((j - hole) & mask))
+		{
+			topk->map_ids[hole]				   = topk->map_ids[j];
+			topk->map_pos[hole]				   = topk->map_pos[j];
+			topk->ub_slot[topk->map_pos[hole]] = hole;
+			hole							   = j;
+		}
+	}
+	topk->map_pos[hole] = VS_TOPK_MAP_EMPTY;
+}
+
+/* Allocate the map on first use, or rebuild it after unique inserts. */
+static void
+map_rebuild(VsTopK *topk)
+{
+	if (topk->map_pos == NULL)
+	{
+		uint32_t bits = 1;
+		while ((1ull << bits) < 2ull * topk->k_capacity)
+			bits++;
+
+		uint32_t nslots = 1u << bits;
+		topk->map_ids =
+				vs_memctx_alloc(topk->memctx, nslots * sizeof(uint64_t));
+		topk->map_pos =
+				vs_memctx_alloc(topk->memctx, nslots * sizeof(uint32_t));
+		topk->ub_slot = vs_memctx_alloc(
+				topk->memctx, topk->k_capacity * sizeof(uint32_t));
+		topk->map_mask	= nslots - 1;
+		topk->map_shift = 64 - bits;
+	}
+
+	memset(topk->map_pos, 0xFF, (topk->map_mask + 1) * sizeof(uint32_t));
+	for (uint32_t i = 0; i < topk->ub_count; i++)
+		map_add(topk, topk->ub_ids[i], i);
+	topk->map_stale = false;
+}
+
+/* ----------------------------------------------------------------
+ * Threshold heap (max-heap of Distance values)
+ *
+ * With `track`, every move also updates the id map.
+ * ---------------------------------------------------------------- */
+
+static inline void
+ub_swap(VsTopK *topk, uint32_t a, uint32_t b, bool track)
+{
+	Distance tmp	 = topk->ub_heap[a];
+	topk->ub_heap[a] = topk->ub_heap[b];
+	topk->ub_heap[b] = tmp;
+	uint64_t tid	 = topk->ub_ids[a];
+	topk->ub_ids[a]	 = topk->ub_ids[b];
+	topk->ub_ids[b]	 = tid;
+
+	if (track)
+	{
+		uint32_t sa		  = topk->ub_slot[a];
+		uint32_t sb		  = topk->ub_slot[b];
+		topk->ub_slot[a]  = sb;
+		topk->ub_slot[b]  = sa;
+		topk->map_pos[sb] = a;
+		topk->map_pos[sa] = b;
+	}
+}
+
+static inline void
+ub_sift_up(VsTopK *topk, uint32_t i, bool track)
 {
 	while (i > 0)
 	{
 		uint32_t parent = (i - 1) / 2;
-		if (heap[i] <= heap[parent])
+		if (topk->ub_heap[i] <= topk->ub_heap[parent])
 			break;
-		Distance tmp = heap[i];
-		heap[i]		 = heap[parent];
-		heap[parent] = tmp;
-		uint64_t tid = ids[i];
-		ids[i]		 = ids[parent];
-		ids[parent]	 = tid;
-		i			 = parent;
+		ub_swap(topk, i, parent, track);
+		i = parent;
 	}
 }
 
-static void
-ub_sift_down(Distance *heap, uint64_t *ids, uint32_t count)
+static inline void
+ub_sift_down(VsTopK *topk, uint32_t i, bool track)
 {
-	uint32_t i = 0;
+	const Distance *heap  = topk->ub_heap;
+	uint32_t		count = topk->ub_count;
+
 	for (;;)
 	{
 		uint32_t left	 = 2 * i + 1;
@@ -61,40 +174,8 @@ ub_sift_down(Distance *heap, uint64_t *ids, uint32_t count)
 		if (largest == i)
 			break;
 
-		Distance tmp  = heap[i];
-		heap[i]		  = heap[largest];
-		heap[largest] = tmp;
-		uint64_t tid  = ids[i];
-		ids[i]		  = ids[largest];
-		ids[largest]  = tid;
-		i			  = largest;
-	}
-}
-
-static void
-ub_sift_down_from(Distance *heap, uint64_t *ids, uint32_t count, uint32_t i)
-{
-	for (;;)
-	{
-		uint32_t left	 = 2 * i + 1;
-		uint32_t right	 = 2 * i + 2;
-		uint32_t largest = i;
-
-		if (left < count && heap[left] > heap[largest])
-			largest = left;
-		if (right < count && heap[right] > heap[largest])
-			largest = right;
-
-		if (largest == i)
-			break;
-
-		Distance tmp  = heap[i];
-		heap[i]		  = heap[largest];
-		heap[largest] = tmp;
-		uint64_t tid  = ids[i];
-		ids[i]		  = ids[largest];
-		ids[largest]  = tid;
-		i			  = largest;
+		ub_swap(topk, i, largest, track);
+		i = largest;
 	}
 }
 
@@ -137,6 +218,13 @@ vs_topk_init(VsTopK *topk, uint32_t k)
 	topk->cand_capacity = cap;
 	/* Stamped onto every insert; only the query scan ever sets it. */
 	topk->cur_src = 0;
+
+	topk->map_ids	= NULL;
+	topk->map_pos	= NULL;
+	topk->ub_slot	= NULL;
+	topk->map_mask	= 0;
+	topk->map_shift = 0;
+	topk->map_stale = false;
 }
 
 void
@@ -152,6 +240,9 @@ vs_topk_cleanup(VsTopK *topk)
 	topk->ub_heap	 = NULL;
 	topk->ub_ids	 = NULL;
 	topk->candidates = NULL;
+	topk->map_ids	 = NULL;
+	topk->map_pos	 = NULL;
+	topk->ub_slot	 = NULL;
 }
 
 VsTopK *
@@ -207,6 +298,16 @@ vs_topk_reset_to_k(VsTopK *topk, uint32_t k)
 				vs_memctx_alloc(topk->memctx, cand_cap * sizeof(VsTopKEntry));
 		topk->cand_capacity = cand_cap;
 		topk->k_capacity	= k;
+		topk->map_ids		= NULL;
+		topk->map_pos		= NULL;
+		topk->ub_slot		= NULL;
+		topk->map_stale		= false;
+	}
+	else if (topk->map_pos != NULL && !topk->map_stale)
+	{
+		/* Clear only the occupied slots: O(ub_count), not O(map size). */
+		for (uint32_t i = 0; i < topk->ub_count; i++)
+			topk->map_pos[topk->ub_slot[i]] = VS_TOPK_MAP_EMPTY;
 	}
 
 	topk->k			 = k;
@@ -229,19 +330,20 @@ vs_topk_insert_unique(
 	if (!(lb < vs_topk_threshold(topk)))
 		return;
 
-	/* No dedup scan: caller guarantees ids are unique. */
+	/* No dedup lookup: caller guarantees ids are unique. */
+	topk->map_stale = true;
 	if (topk->ub_count < topk->k)
 	{
 		topk->ub_heap[topk->ub_count] = ub;
 		topk->ub_ids[topk->ub_count]  = id;
 		topk->ub_count++;
-		ub_sift_up(topk->ub_heap, topk->ub_ids, topk->ub_count - 1);
+		ub_sift_up(topk, topk->ub_count - 1, false);
 	}
 	else if (ub < topk->ub_heap[0])
 	{
 		topk->ub_heap[0] = ub;
 		topk->ub_ids[0]	 = id;
-		ub_sift_down(topk->ub_heap, topk->ub_ids, topk->ub_count);
+		ub_sift_down(topk, 0, false);
 	}
 
 	/* Grow candidate buffer if needed (old buffer freed with memctx) */
@@ -283,37 +385,41 @@ vs_topk_insert(VsTopK *topk, Distance distance, Distance error, uint64_t id)
 	if (!(lb < vs_topk_threshold(topk)))
 		return;
 
-	/* Dedup: check if this ID is already in the heap. If so,
-	 * only keep the entry with the better (smaller) upper bound.
-	 * This prevents duplicates (e.g. SOAR replicas) from occupying
-	 * multiple heap slots and inflating the threshold. */
-	for (uint32_t i = 0; i < topk->ub_count; i++)
+	/* Dedup: if this ID is already in the heap, keep only the better
+	 * (smaller) upper bound. This prevents duplicates (e.g. SOAR
+	 * replicas) from occupying multiple heap slots and inflating the
+	 * threshold. */
+	if (vs_unlikely(topk->map_pos == NULL || topk->map_stale))
+		map_rebuild(topk);
+
+	uint32_t slot = map_find(topk, id);
+	if (slot != VS_TOPK_MAP_EMPTY)
 	{
-		if (topk->ub_ids[i] == id)
+		uint32_t i = topk->map_pos[slot];
+		if (ub < topk->ub_heap[i])
 		{
-			if (ub < topk->ub_heap[i])
-			{
-				topk->ub_heap[i] = ub;
-				ub_sift_down_from(
-						topk->ub_heap, topk->ub_ids, topk->ub_count, i);
-			}
-			goto append;
+			topk->ub_heap[i] = ub;
+			ub_sift_down(topk, i, true);
 		}
+		goto append;
 	}
 
 	/* Update threshold heap */
 	if (topk->ub_count < topk->k)
 	{
-		topk->ub_heap[topk->ub_count] = ub;
-		topk->ub_ids[topk->ub_count]  = id;
-		topk->ub_count++;
-		ub_sift_up(topk->ub_heap, topk->ub_ids, topk->ub_count - 1);
+		uint32_t i		 = topk->ub_count++;
+		topk->ub_heap[i] = ub;
+		topk->ub_ids[i]	 = id;
+		map_add(topk, id, i);
+		ub_sift_up(topk, i, true);
 	}
 	else if (ub < topk->ub_heap[0])
 	{
+		map_remove(topk, topk->ub_slot[0]);
 		topk->ub_heap[0] = ub;
 		topk->ub_ids[0]	 = id;
-		ub_sift_down(topk->ub_heap, topk->ub_ids, topk->ub_count);
+		map_add(topk, id, 0);
+		ub_sift_down(topk, 0, true);
 	}
 
 append:
