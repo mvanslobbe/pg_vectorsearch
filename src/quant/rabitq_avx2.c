@@ -48,11 +48,8 @@ expand_byte_to_mask_avx2(uint8_t byte)
 	/* Test each bit: (byte & bit_pos) != 0 */
 	__m256i masked = _mm256_and_si256(vbyte, bit_positions);
 
-	/* Compare to zero - creates all 1s for non-zero, all 0s for zero */
-	__m256i cmp = _mm256_cmpeq_epi32(masked, _mm256_setzero_si256());
-
-	/* Invert: we want 1s where bit is set */
-	__m256i result = _mm256_xor_si256(cmp, _mm256_set1_epi32(-1));
+	/* Each lane of masked is 0 or its bit: all 1s where the bit is set */
+	__m256i result = _mm256_cmpeq_epi32(masked, bit_positions);
 
 	return _mm256_castsi256_ps(result);
 }
