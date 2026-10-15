@@ -28,8 +28,8 @@
 /*
  * 2^64 divided by the golden ratio, rounded to odd (the splitmix64
  * increment). Multiplying by it scatters consecutive or structured
- * ids across the high bits, which the mask then folds onto the slot
- * range (Fibonacci hashing).
+ * ids across the high bits, which the slot index is taken from
+ * (Fibonacci hashing).
  */
 #define VS_HASH_GOLDEN_GAMMA 0x9E3779B97F4A7C15ULL
 
@@ -65,6 +65,17 @@ vs_idset_init(VsIdSet *set, uint32_t expected)
 }
 
 /*
+ * Home slot of `id`. Takes bits 32 and up of the product: the low bits
+ * of id * odd depend only on the low bits of id, so a mask over them
+ * would map every posting-encoded TID with the same offset to one slot.
+ */
+static inline uint32_t
+vs_idset_home_slot(const VsIdSet *set, uint64_t id)
+{
+	return (uint32_t)((id * VS_HASH_GOLDEN_GAMMA) >> 32) & set->mask;
+}
+
+/*
  * Insert `id` if absent. Returns true when the id was newly added,
  * false when it was already a member.
  */
@@ -79,7 +90,7 @@ vs_idset_test_add(VsIdSet *set, uint64_t id)
 		return true;
 	}
 
-	uint32_t slot = (uint32_t)(id * VS_HASH_GOLDEN_GAMMA) & set->mask;
+	uint32_t slot = vs_idset_home_slot(set, id);
 	while (set->slots[slot] != 0 && set->slots[slot] != id)
 		slot = (slot + 1) & set->mask;
 	if (set->slots[slot] == id)

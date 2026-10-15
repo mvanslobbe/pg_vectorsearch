@@ -9,6 +9,7 @@
  * - Id 0 handling via the dedicated flag
  * - Collision chains at the sizing bound (load factor <= 1/2)
  * - Structured id patterns (posting-encoded TIDs)
+ * - Probe chains stay short for TIDs that share an offset
  */
 
 #include "core/idset.h"
@@ -67,6 +68,35 @@ TEST(idset_full_population)
 			dups++;
 	}
 	ASSERT_EQ(n, dups, "every re-add reports membership");
+
+	vs_idset_cleanup(&set);
+}
+
+TEST(idset_tid_offsets_do_not_cluster)
+{
+	/* Many blocks, few distinct offsets. A hash that sees only the low
+	 * bits of the id sends every id with the same offset to one slot. */
+	const uint32_t n = 20000;
+
+	VsIdSet set;
+	vs_idset_init(&set, n);
+
+	for (uint32_t i = 0; i < n; i++)
+	{
+		uint64_t id = ((uint64_t)(100 + i / 4) << 16) | ((i % 4) + 1);
+		(void)vs_idset_test_add(&set, id);
+	}
+
+	uint64_t displaced = 0;
+	for (uint32_t slot = 0; slot <= set.mask; slot++)
+	{
+		uint64_t id = set.slots[slot];
+		if (id == 0)
+			continue;
+		uint32_t home = vs_idset_home_slot(&set, id);
+		displaced += (slot - home) & set.mask;
+	}
+	ASSERT_TRUE(displaced / n < 8, "probe chains stay short");
 
 	vs_idset_cleanup(&set);
 }
